@@ -1,4 +1,24 @@
 import asyncio
+from dataclasses import dataclass
+#Weakness: it spreads request counts, not work. If backend3 is five times slower, it still gets a third of the requests and its queue grows while backend1 sits idle. You’ll measure this, and it’s why least-connections exists.
+@dataclass
+class Backend:
+    host: str
+    port: int
+    healthy: bool = True   # health checks will flip this later
+    active: int = 0        # connections in flight right now
+    total: int = 0         # requests handled so far
+
+    @property
+    def name(self):
+        return f"{self.host}:{self.port}"
+
+
+BACKENDS = [
+    Backend("127.0.0.1", 9001),
+    Backend("127.0.0.1", 9002),
+    Backend("127.0.0.1", 9003),
+]
 
 LISTEN_PORT = 8080
 BACKEND_PORT = 9001
