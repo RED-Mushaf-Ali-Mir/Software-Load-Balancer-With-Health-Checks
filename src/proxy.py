@@ -1,5 +1,9 @@
 import asyncio
 from dataclasses import dataclass
+import argparse
+import zlib
+
+import yaml
 #Weakness: it spreads request counts, not work. If backend3 is five times slower, it still gets a third of the requests and its queue grows while backend1 sits idle. You’ll measure this, and it’s why least-connections exists.
 @dataclass
 class Backend:
@@ -16,11 +20,11 @@ class Backend:
 
 LISTEN_PORT = 8080
 
-class Round_Robin:
+class RoundRobin:
     def __init__ (self , backends):
         self.backends = backends
         self.index = 0
-    def pick(self):
+    def pick(self , client_ip = None):
         n = len(self.backends)
         for _ in range(n):
             b = self.backends[self.index % n]
@@ -28,6 +32,36 @@ class Round_Robin:
             if b.healthy:
                 return b
         return None
+
+class LeastConnections:
+    
+    def __init__ (self , backends):
+        self.backends = backends
+    
+    def pick(self , client_ip = None):
+        healthy = [b for b in self.backends if b.healthy]
+        if not healthy:
+            return None
+        return min(healthy , key=lambda b:(b.active , b.total))
+
+class IPHash:
+    def __init__ (self , backends):
+        self.backends = backends
+    def pick (self , client_ip = None):
+        n = len(self.backends)
+        start = zlib.crc32(client_ip.encode()) % n
+        for i in range(n):
+            b = self.backends[(start + i) % n]
+            if b.healthy:
+                return b
+        return None
+ 
+ALGOS = {
+    "roundrobin": RoundRobin,
+    "leastconn": LeastConnections,
+    "iphash": IPHash,
+}
+
 
 async def send_error(writer, status, message):
     body = (message + "\n").encode()
@@ -47,7 +81,7 @@ def make_handler (balancer):
         try:
             request = await client_reader.readuntil(b"\r\n\r\n")
 
-            picked = balancer.pick()
+            picked = balancer.pick(client_addr)
             if picked is None:
                 await send_error(client_writer , "503 Service Unavailable","No healthy backends")
                 return
@@ -85,20 +119,26 @@ def make_handler (balancer):
             client_writer.close()
 
     return handle_client
+    
+def parse_args():
+    p = argparse.ArgumentParser(description="Software load balancer")
+    p.add_argument("--algo", choices=ALGOS.keys(), default="roundrobin")
+    p.add_argument("--config", default="config.yaml")
+    return p.parse_args()
 
 async def main():
+    args = parse_args()
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
 
-    backends = [
-        Backend("127.0.0.1", 9001),
-        Backend("127.0.0.1", 9002),
-        Backend("127.0.0.1", 9003),
-    ]
-    balancer = Round_Robin(backends)
-    server = await asyncio.start_server(make_handler(balancer), "127.0.0.1", LISTEN_PORT)
+    backends = [Backend(b["host"], b["port"]) for b in cfg["backends"]]
+    balancer = ALGOS[args.algo](backends)
 
-    print(f"LB listening on {LISTEN_PORT}, round robin over {[b.name for b in backends]}")
-
+    host, port = cfg["listen"]["host"], cfg["listen"]["port"]
+    server = await asyncio.start_server(make_handler(balancer), host, port)
+    print(f"LB on {host}:{port}, algo={args.algo}, backends={[b.name for b in backends]}")
     async with server:
         await server.serve_forever()
+
 
 asyncio.run(main())
