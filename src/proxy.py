@@ -14,59 +14,91 @@ class Backend:
         return f"{self.host}:{self.port}"
 
 
-BACKENDS = [
-    Backend("127.0.0.1", 9001),
-    Backend("127.0.0.1", 9002),
-    Backend("127.0.0.1", 9003),
-]
-
 LISTEN_PORT = 8080
-BACKEND_PORT = 9001
-BACKEND_HOST = "127.0.0.1"
 
-async def handle_client(client_reader , client_writer):
-	client_addr = client_writer.get_extra_info("peername")
-	backend_writer = None
-	
-	try:
-		request = await client_reader.readuntil(b"\r\n\r\n")
-		
-		try:
-			backend_reader , backend_writer = await asyncio.open_connection(BACKEND_HOST , BACKEND_PORT)
-		except OSError:
-			body = b"Bad Gateway: backend unreachable\n"
-			client_writer.write(
-				b"HTTP/1.1 502 Bad Gateway\r\n"
-				b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-				b"Connection: close\r\n\r\n" + body
-			)
-			await client_writer.drain()
-			return
-		backend_writer.write(request)
-		await backend_writer.drain()
-	        
-		while True:
-			chunk = await backend_reader.read(4096)
-			if not chunk:
-				break
-			client_writer.write(chunk)
-			await client_writer.drain()
-		print(f"Served {client_addr} via backend {BACKEND_PORT}")
-	        	
-	except asyncio.IncompleteReadError:
-		pass
-	
-	finally:
-		if backend_writer:
-			backend_writer.close()
-		client_writer.close()
+class Round_Robin:
+    def __init__ (self , backends):
+        self.backends = backends
+        self.index = 0
+    def pick(self):
+        n = len(self.backends)
+        for _ in range(n):
+            b = self.backends[self.index % n]
+            self.index += 1
+            if b.healthy:
+                return b
+        return None
 
+async def send_error(writer, status, message):
+    body = (message + "\n").encode()
+    writer.write(
+        f"HTTP/1.1 {status}\r\n".encode()
+        + b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"Connection: close\r\n\r\n" + body
+    )
+    await writer.drain()
+
+def make_handler (balancer):
+    async def handle_client(client_reader , client_writer):
+        client_addr = client_writer.get_extra_info("peername")
+        backend_writer = None
+        backend = None
+
+        try:
+            request = await client_reader.readuntil(b"\r\n\r\n")
+
+            picked = balancer.pick()
+            if picked is None:
+                await send_error(client_writer , "503 Service Unavailable","No healthy backends")
+                return
+            picked.active += 1
+            picked.total += 1
+            backend = picked
+
+            try:
+                backend_reader , backend_writer = await asyncio.open_connection(backend.host, backend.port)
+
+            except OSError:
+                await send_error(client_writer, "502 Bad Gateway",
+                                 f"Backend {backend.name} unreachable")
+                return
+
+            backend_writer.write(request)
+            await backend_writer.drain()
+
+            while True:
+                chunk = await backend_reader.read(4096)
+                if not chunk:
+                    break
+                client_writer.write(chunk)
+                await client_writer.drain()
+            print(f"Served {client_addr} via backend {backend.port}")
+
+        except asyncio.IncompleteReadError:
+            pass
+
+        finally:
+            if backend:
+                backend.active -= 1
+            if backend_writer:
+                backend_writer.close()
+            client_writer.close()
+
+    return handle_client
 
 async def main():
 
-	server = await asyncio.start_server(handle_client , "127.0.0.1" , LISTEN_PORT)
-	print(f"Porxy Listening on {LISTEN_PORT} , to {BACKEND_PORT}")
-	async with server:
-		await server.serve_forever()
+    backends = [
+        Backend("127.0.0.1", 9001),
+        Backend("127.0.0.1", 9002),
+        Backend("127.0.0.1", 9003),
+    ]
+    balancer = Round_Robin(backends)
+    server = await asyncio.start_server(make_handler(balancer), "127.0.0.1", LISTEN_PORT)
+
+    print(f"LB listening on {LISTEN_PORT}, round robin over {[b.name for b in backends]}")
+
+    async with server:
+        await server.serve_forever()
 
 asyncio.run(main())
