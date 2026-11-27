@@ -2,7 +2,7 @@ import asyncio
 from dataclasses import dataclass
 import argparse
 import zlib
-
+from datetime import datetime
 import yaml
 #Weakness: it spreads request counts, not work. If backend3 is five times slower, it still gets a third of the requests and its queue grows while backend1 sits idle. You’ll measure this, and it’s why least-connections exists.
 @dataclass
@@ -72,16 +72,56 @@ async def send_error(writer, status, message):
     )
     await writer.drain()
 
+async def check_once(backend, timeout):
+    """Return True if backend answers GET /health with status 200."""
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(backend.host, backend.port), timeout)
+        writer.write(
+            b"GET /health HTTP/1.1\r\n"
+            b"Host: lb\r\n"
+            b"Connection: close\r\n\r\n")
+        await writer.drain()
+        status_line = await asyncio.wait_for(reader.readline(), timeout)
+        return b" 200 " in status_line
+    except (OSError, asyncio.TimeoutError):
+        return False
+    finally:
+        if writer:
+            writer.close()
+
+def ts():
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+async def watch(backend, interval, fail_threshold, timeout):
+    fails = 0                                   # consecutive failures
+    while True:
+        ok = await check_once(backend, timeout)
+        if ok:
+            fails = 0
+            if not backend.healthy:             # B1: one success brings it back
+                backend.healthy = True
+                print(f"[{ts()}] [health] {backend.name} is UP")
+        else:
+            fails += 1
+            if fails >= fail_threshold and backend.healthy:
+                backend.healthy = False
+                print(f"[{ts()}] [health] {backend.name} is DOWN ({fails} failures)")
+        await asyncio.sleep(interval)       
+    
+
 def make_handler (balancer):
     async def handle_client(client_reader , client_writer):
         client_addr = client_writer.get_extra_info("peername")
+        client_ip = client_addr[0]
         backend_writer = None
         backend = None
 
         try:
             request = await client_reader.readuntil(b"\r\n\r\n")
 
-            picked = balancer.pick(client_addr)
+            picked = balancer.pick(client_ip)
             if picked is None:
                 await send_error(client_writer , "503 Service Unavailable","No healthy backends")
                 return
