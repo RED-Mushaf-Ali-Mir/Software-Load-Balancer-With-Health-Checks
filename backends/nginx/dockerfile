@@ -1,2 +1,8 @@
-FROM nginx:alpine
-COPY default.conf.template /etc/nginx/templates/default.conf.template
+FROM python:3.12-alpine
+
+RUN apk add --no-cache nginx
+
+COPY app.py /app/app.py
+COPY default.conf.template /etc/nginx/http.d/default.conf
+
+CMD ["sh", "-c", "python3 /app/app.py & exec nginx -g 'daemon off;'"]
