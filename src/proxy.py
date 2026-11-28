@@ -173,12 +173,20 @@ async def main():
 
     backends = [Backend(b["host"], b["port"]) for b in cfg["backends"]]
     balancer = ALGOS[args.algo](backends)
-
+    health = cfg["health"]
+    wacthers =[ #So non-rerenced task dont get grabage collected
+        asyncio.create_task(
+            watch(b , health["interval_s"] , health["fail_threshold"], health.get("timeout" , 1.0))
+        )
+        for b in backends
+    ]
     host, port = cfg["listen"]["host"], cfg["listen"]["port"]
     server = await asyncio.start_server(make_handler(balancer), host, port)
     print(f"LB on {host}:{port}, algo={args.algo}, backends={[b.name for b in backends]}")
+    
     async with server:
         await server.serve_forever()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
